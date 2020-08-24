@@ -11,14 +11,26 @@ import {
     Projection,
     ProjectionType
 } from "@here/harp-geoutils";
-import { LoggerManager } from "@here/harp-utils";
-import { Frustum, Line3, Matrix4, PerspectiveCamera, Plane, Ray, Vector3 } from "three";
+import { assert, LoggerManager } from "@here/harp-utils";
+import { Frustum, Line3, Matrix4, PerspectiveCamera, Plane, Ray, Sphere, Vector3 } from "three";
 
 import { TileCorners } from "./geometry/TileGeometryCreator";
 import { MapViewUtils } from "./Utils";
 
 const logger = LoggerManager.instance.create("BoundsGenerator");
 
+enum FarPlaneSide {
+    Bottom,
+    Right,
+    Top,
+    Left
+}
+
+enum FarPlaneSideIntersectionDir {
+    Cw,
+    Ccw,
+    Both
+}
 /**
  * Generates Bounds for a camera view and a projection
  *
@@ -27,11 +39,12 @@ const logger = LoggerManager.instance.create("BoundsGenerator");
 export class BoundsGenerator {
     private readonly m_groundPlaneNormal = new Vector3(0, 0, 1);
     private readonly m_groundPlane = new Plane(this.m_groundPlaneNormal.clone());
+    private readonly m_groundSphere = new Sphere(undefined, EarthConstants.EQUATORIAL_RADIUS);
 
     constructor(
         private readonly m_camera: PerspectiveCamera,
         private m_projection: Projection,
-        private readonly m_tileWrappingEnabled: boolean = false
+        public tileWrappingEnabled: boolean = false
     ) {}
 
     set projection(projection: Projection) {
@@ -43,93 +56,251 @@ export class BoundsGenerator {
      * The coordinates are sorted to ccw winding, so a polygon could be drawn with them.
      */
     generate(): GeoPolygon | undefined {
-        //TODO: support spherical projection
+        return this.m_projection.type === ProjectionType.Planar
+            ? this.generateOnPlane()
+            : this.generateOnSphere();
+    }
 
+    private createPolygon(
+        coordinates: GeoCoordinates[],
+        sort: boolean,
+        normalize: boolean = false
+    ): GeoPolygon | undefined {
+        if (coordinates.length > 2) {
+            if (normalize) {
+                this.normalizeCoordinates(coordinates);
+            }
+            return new GeoPolygon(coordinates as GeoPolygonCoordinates, sort);
+        }
+        return undefined;
+    }
+
+    private normalizeCoordinates(coordinates: GeoCoordinates[]) {
+        // TODO: Is this enough? What about views including poles? -> Doesn't work when
+        // far plane is set too far by FarPlaneEvaluator (should be fixed there).
+        let minLongitude = Infinity;
+        let maxLongitude = -Infinity;
+        for (const geoCoords of coordinates) {
+            minLongitude = Math.min(minLongitude, geoCoords.longitude);
+            maxLongitude = Math.max(maxLongitude, geoCoords.longitude);
+        }
+
+        if (minLongitude >= 0 || maxLongitude < 0) {
+            return;
+        }
+
+        const cameraTarget = MapViewUtils.rayCastWorldCoordinates(
+            { camera: this.m_camera, projection: this.m_projection },
+            0,
+            0
+        );
+
+        if (cameraTarget) {
+            const targetLongitude = this.m_projection.unprojectPoint(cameraTarget).longitude;
+            if (targetLongitude > -90 && targetLongitude < 90) {
+                return;
+            }
+        } else if (maxLongitude - minLongitude < 360 + minLongitude - maxLongitude) {
+            return;
+        }
+
+        for (const geoCoord of coordinates) {
+            if (geoCoord.longitude < 0) {
+                geoCoord.longitude = 360 + geoCoord.longitude;
+            }
+        }
+    }
+
+    private addLineSphereIntersection(
+        coordinates: GeoCoordinates[],
+        lineStartWorld: Vector3,
+        lineEndWorld: Vector3
+    ) {
+        assert(this.m_projection.type === ProjectionType.Spherical);
+
+        const line = new Line3(lineStartWorld, lineEndWorld);
+        const ray = new Ray(line.start);
+        line.delta(ray.direction);
+        const intersection = ray.intersectSphere(this.m_groundSphere, new Vector3());
+        if (intersection) {
+            const t = line.closestPointToPointParameter(intersection);
+            if (t >= 0 && t <= 1) {
+                coordinates.push(this.m_projection.unprojectPoint(intersection));
+            }
+        }
+    }
+
+    private addFarPlaneSideIntersections(
+        coordinates: GeoCoordinates[],
+        side: FarPlaneSide,
+        direction: FarPlaneSideIntersectionDir = FarPlaneSideIntersectionDir.Both
+    ) {
+        assert(this.m_projection.type === ProjectionType.Spherical);
+
+        // Corners must be in counter-clockwise order.
+        const ccwStartCorner = new Vector3();
+        const ccwEndCorner = new Vector3();
+        switch (side) {
+            case FarPlaneSide.Bottom:
+                ccwStartCorner.set(-1, -1, 1); // bottom left
+                ccwEndCorner.set(1, -1, 1); // bottom right
+                break;
+            case FarPlaneSide.Right:
+                ccwStartCorner.set(1, -1, 1); // bottom right
+                ccwEndCorner.set(1, 1, 1); // top right
+                break;
+            case FarPlaneSide.Top:
+                ccwStartCorner.set(1, 1, 1); // top right
+                ccwEndCorner.set(-1, 1, 1); // top left
+                break;
+            case FarPlaneSide.Left:
+                ccwStartCorner.set(-1, 1, 1); // top left
+                ccwEndCorner.set(-1, -1, 1); // bottom left
+                break;
+        }
+
+        const ccwStartCornerWorld = ccwStartCorner.unproject(this.m_camera);
+        const ccwEndCornerWorld = ccwEndCorner.unproject(this.m_camera);
+
+        if (direction !== FarPlaneSideIntersectionDir.Cw) {
+            this.addLineSphereIntersection(coordinates, ccwStartCornerWorld, ccwEndCornerWorld);
+        }
+
+        if (direction !== FarPlaneSideIntersectionDir.Ccw) {
+            this.addLineSphereIntersection(coordinates, ccwEndCornerWorld, ccwStartCornerWorld);
+        }
+    }
+
+    private findBoundsIntersectionsOnSphere(): GeoCoordinates[] {
+        assert(this.m_projection.type === ProjectionType.Spherical);
+
+        const coordinates: GeoCoordinates[] = [];
+
+        // 1.) Raycast into all four corners of the canvas
+        //     => if an intersection is found, add it to the polygon
+        this.addCanvasCornerIntersection(coordinates, false);
+
+        // => All 4 corners found an intersection, therefore the screen is covered with the map
+        // and the polygon complete
+        if (coordinates.length === 4) {
+            return coordinates;
+        }
+
+        // Asumptions: No camera roll
+
+        if (coordinates.length === 0) {
+            this.addFarPlaneSideIntersections(coordinates, FarPlaneSide.Bottom);
+            this.addFarPlaneSideIntersections(coordinates, FarPlaneSide.Right);
+            this.addFarPlaneSideIntersections(coordinates, FarPlaneSide.Top);
+            this.addFarPlaneSideIntersections(coordinates, FarPlaneSide.Left);
+        } else {
+            assert(coordinates.length === 2);
+            this.addFarPlaneSideIntersections(
+                coordinates,
+                FarPlaneSide.Right,
+                FarPlaneSideIntersectionDir.Cw
+            );
+            this.addFarPlaneSideIntersections(coordinates, FarPlaneSide.Top);
+            this.addFarPlaneSideIntersections(
+                coordinates,
+                FarPlaneSide.Left,
+                FarPlaneSideIntersectionDir.Ccw
+            );
+        }
+
+        // TODO: Check pole intersections.
+
+        return coordinates;
+    }
+
+    private subdivideSides(coordinates: GeoCoordinates[]): GeoCoordinates[] {
+        // Divide if side larger than 5deg lon or 20 latitude.
+        return coordinates;
+    }
+
+    private generateOnSphere(): GeoPolygon | undefined {
+        assert(this.m_projection.type === ProjectionType.Spherical);
+
+        const coordinates = this.subdivideSides(this.findBoundsIntersectionsOnSphere());
+        return this.createPolygon(coordinates, true, true);
+    }
+
+    private generateOnPlane(): GeoPolygon | undefined {
         //!!!!!!!ALTITUDE IS NOT TAKEN INTO ACCOUNT!!!!!!!!!
         const coordinates: GeoCoordinates[] = [];
 
-        //CASE A: FLAT PROJECTION
-        if (this.m_projection.type === ProjectionType.Planar) {
-            // 1.) Raycast into all four corners of the canvas
-            //     => if an intersection is found, add it to the polygon
-            this.addCanvasCornerIntersection(coordinates);
+        // 1.) Raycast into all four corners of the canvas
+        //     => if an intersection is found, add it to the polygon
+        this.addCanvasCornerIntersection(coordinates);
 
-            // => All 4 corners found an intersection, therefore the screen is covered with the map
-            // and the polygon complete
-            if (coordinates.length === 4) {
-                return new GeoPolygon(coordinates as GeoPolygonCoordinates, true);
-            }
+        // => All 4 corners found an intersection, therefore the screen is covered with the map
+        // and the polygon complete
+        if (coordinates.length === 4) {
+            return this.createPolygon(coordinates, true);
+        }
 
-            //2.) Raycast into the two corners of the horizon cutting the canvas sides
-            //    => if an intersection is found, add it to the polygon
-            this.addHorizonIntersection(coordinates);
+        //2.) Raycast into the two corners of the horizon cutting the canvas sides
+        //    => if an intersection is found, add it to the polygon
+        this.addHorizonIntersection(coordinates);
 
-            //Setup the frustum for further checks
-            const frustum = new Frustum().setFromProjectionMatrix(
-                new Matrix4().multiplyMatrices(
-                    this.m_camera.projectionMatrix,
-                    this.m_camera.matrixWorldInverse
-                )
-            );
+        //Setup the frustum for further checks
+        const frustum = new Frustum().setFromProjectionMatrix(
+            new Matrix4().multiplyMatrices(
+                this.m_camera.projectionMatrix,
+                this.m_camera.matrixWorldInverse
+            )
+        );
 
-            // Setup the world corners for further checks.
-            // Cast to TileCorners as it cannot be undefined here, due to the forced
-            // PlanarProjection above
-            const worldCorners: TileCorners = this.getWorldConers(this.m_projection) as TileCorners;
+        // Setup the world corners for further checks.
+        // Cast to TileCorners as it cannot be undefined here, due to the forced
+        // PlanarProjection above
+        const worldCorners: TileCorners = this.getWorldConers(this.m_projection) as TileCorners;
 
-            if (!this.m_tileWrappingEnabled) {
-                // 3.) If no wrapping, check if any corners of the world plane are inside the view
-                //     => if true, add it to the polygon
-                [worldCorners.ne, worldCorners.nw, worldCorners.se, worldCorners.sw].forEach(
-                    corner => {
-                        this.addPointInFrustum(corner, frustum, coordinates);
-                    }
-                );
-            }
+        if (!this.tileWrappingEnabled) {
+            // 3.) If no wrapping, check if any corners of the world plane are inside the view
+            //     => if true, add it to the polygon
+            [worldCorners.ne, worldCorners.nw, worldCorners.se, worldCorners.sw].forEach(corner => {
+                this.addPointInFrustum(corner, frustum, coordinates);
+            });
+        }
 
-            //4.) Check for any edges of the world plane intersecting with the frustum?
-            //    => if true, add to polygon
+        //4.) Check for any edges of the world plane intersecting with the frustum?
+        //    => if true, add to polygon
 
-            if (!this.m_tileWrappingEnabled) {
-                // if no tile wrapping:
-                //       check with limited lines around the world edges
-                [
-                    new Line3(worldCorners.sw, worldCorners.se), // south edge
-                    new Line3(worldCorners.ne, worldCorners.nw), // north edge
-                    new Line3(worldCorners.se, worldCorners.ne), // east edge
-                    new Line3(worldCorners.nw, worldCorners.sw) //  west edge
-                ].forEach(edge => {
-                    this.addFrustumIntersection(edge, frustum, coordinates);
-                });
-            } else {
-                // if tile wrapping:
-                //       check for intersections with rays along the south and north edges
-                const directionEast = new Vector3() //west -> east
-                    .subVectors(worldCorners.sw, worldCorners.se)
-                    .normalize();
-                const directionWest = new Vector3() //east -> west
-                    .subVectors(worldCorners.se, worldCorners.sw)
-                    .normalize();
-
-                [
-                    new Ray(worldCorners.se, directionEast), // south east ray
-                    new Ray(worldCorners.se, directionWest), // south west ray
-                    new Ray(worldCorners.ne, directionEast), // north east ray
-                    new Ray(worldCorners.ne, directionWest) //  north west ray
-                ].forEach(ray => {
-                    this.addFrustumIntersection(ray, frustum, coordinates);
-                });
-            }
+        if (!this.tileWrappingEnabled) {
+            // if no tile wrapping:
+            //       check with limited lines around the world edges
+            [
+                new Line3(worldCorners.sw, worldCorners.se), // south edge
+                new Line3(worldCorners.ne, worldCorners.nw), // north edge
+                new Line3(worldCorners.se, worldCorners.ne), // east edge
+                new Line3(worldCorners.nw, worldCorners.sw) //  west edge
+            ].forEach(edge => {
+                this.addFrustumIntersection(edge, frustum, coordinates);
+            });
         } else {
-            logger.warn("This ProjectionType", this.m_projection, " is not yet supported!");
+            // if tile wrapping:
+            //       check for intersections with rays along the south and north edges
+            const directionEast = new Vector3() //west -> east
+                .subVectors(worldCorners.sw, worldCorners.se)
+                .normalize();
+            const directionWest = new Vector3() //east -> west
+                .subVectors(worldCorners.se, worldCorners.sw)
+                .normalize();
+
+            [
+                new Ray(worldCorners.se, directionEast), // south east ray
+                new Ray(worldCorners.se, directionWest), // south west ray
+                new Ray(worldCorners.ne, directionEast), // north east ray
+                new Ray(worldCorners.ne, directionWest) //  north west ray
+            ].forEach(ray => {
+                this.addFrustumIntersection(ray, frustum, coordinates);
+            });
         }
 
         // 5.) Create the Polygon and set needsSort to `true`as we expect it to be convex and
         //     sortable
-        if (coordinates.length > 2) {
-            return new GeoPolygon(coordinates as GeoPolygonCoordinates, true);
-        }
-        return undefined;
+        return this.createPolygon(coordinates, true);
     }
 
     private getWorldConers(projection: Projection): TileCorners | undefined {
@@ -162,29 +333,71 @@ export class BoundsGenerator {
     }
 
     private addHorizonIntersection(geoPolygon: GeoCoordinates[]) {
-        const verticalHorizonPosition = this.getVerticalHorizonPositionInNDC();
-        if (!verticalHorizonPosition) {
-            return;
+        if (this.m_projection.type === ProjectionType.Planar) {
+            const verticalHorizonPosition = this.getVerticalHorizonPositionInNDC();
+            if (!verticalHorizonPosition) {
+                return;
+            }
+            this.addNDCRayIntersection(
+                [
+                    [-1, verticalHorizonPosition], //horizon left
+                    [1, verticalHorizonPosition] //horizon right
+                ],
+                geoPolygon
+            );
+        } else {
+            const topLeftFarPoint = new Vector3(-1, 1, 1).unproject(this.m_camera);
+            const bottomLeftFarPoint = new Vector3(-1, -1, 1).unproject(this.m_camera);
+
+            const leftRay = new Ray(topLeftFarPoint, bottomLeftFarPoint.sub(topLeftFarPoint));
+            const leftHorizonIntersection = leftRay.intersectSphere(
+                this.m_groundSphere,
+                new Vector3()
+            );
+            if (leftHorizonIntersection) {
+                this.validateAndAddToGeoPolygon(leftHorizonIntersection, geoPolygon);
+            }
+
+            const topRightFarPoint = new Vector3(1, 1, 1).unproject(this.m_camera);
+            const bottomRightPoint = new Vector3(1, -1, 1).unproject(this.m_camera);
+            const rightRay = new Ray(topRightFarPoint, bottomRightPoint.sub(topRightFarPoint));
+            const rightHorizonIntersection = rightRay.intersectSphere(
+                this.m_groundSphere,
+                new Vector3()
+            );
+            if (rightHorizonIntersection) {
+                this.validateAndAddToGeoPolygon(rightHorizonIntersection, geoPolygon);
+            }
         }
-        this.addNDCRayIntersection(
-            [
-                [-1, verticalHorizonPosition], //horizon left
-                [1, verticalHorizonPosition] //horizon right
-            ],
-            geoPolygon
-        );
     }
 
-    private addCanvasCornerIntersection(geoPolygon: GeoCoordinates[]) {
-        this.addNDCRayIntersection(
-            [
-                [-1, -1], //lower left
-                [-1, 1], //upper left
-                [1, 1], //upper right
-                [1, -1] //lower right
-            ],
-            geoPolygon
-        );
+    private addCanvasCornerIntersection(
+        geoPolygon: GeoCoordinates[],
+        addMidPoints: boolean = false
+    ) {
+        if (addMidPoints) {
+            this.addNDCRayIntersection(
+                [
+                    [-1, -1], //lower left
+                    //[0, -1], //lower center
+                    [1, -1], //lower right
+                    [1, 1], //upper right
+                    //[0, 1], // upper center
+                    [-1, 1] //upper left
+                ],
+                geoPolygon
+            );
+        } else {
+            this.addNDCRayIntersection(
+                [
+                    [-1, -1], //lower left
+                    [-1, 1], //upper left
+                    [1, 1], //upper right
+                    [1, -1] //lower right
+                ],
+                geoPolygon
+            );
+        }
     }
 
     private validateAndAddToGeoPolygon(point: Vector3, geoPolygon: GeoCoordinates[]) {
@@ -200,7 +413,7 @@ export class BoundsGenerator {
             }
 
             if (
-                !this.m_tileWrappingEnabled &&
+                !this.tileWrappingEnabled &&
                 (point.x < 0 || point.x > EarthConstants.EQUATORIAL_CIRCUMFERENCE)
             ) {
                 return false;

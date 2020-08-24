@@ -31,7 +31,8 @@ export namespace BoundsExample {
   <br />  Press "h" to look at the last created Polygon's BoundingBox
   <br />  Press "g" to look at the last created Polygon
   <br />  Press "b" to show the boundingbox of the Polygon
-  <br />  Press "p" to toggle the projection (!!bounds creation for sphere projection is not yet implemented)`;
+  <br />  Press "p" to toggle the projection (!!bounds creation for sphere projection is not yet implemented)
+  <br />  Press "w" to toggle tile wrapping in planar projection`;
 
     message.style.position = "absolute";
     message.style.cssFloat = "right";
@@ -154,7 +155,7 @@ export namespace BoundsExample {
                     map.lookAt({ bounds });
                     break;
                 case "p":
-                    map.projection =
+                    boundsGenerator.projection = map.projection =
                         map.projection === mercatorProjection
                             ? sphereProjection
                             : mercatorProjection;
@@ -184,6 +185,11 @@ export namespace BoundsExample {
                         "far: ",
                         map.camera.far
                     );
+                    break;
+                case "w":
+                    mapView.tileWrappingEnabled = !mapView.tileWrappingEnabled;
+                    boundsGenerator.tileWrappingEnabled = mapView.tileWrappingEnabled;
+                    mapView.update();
                     break;
                 default:
                     break;
